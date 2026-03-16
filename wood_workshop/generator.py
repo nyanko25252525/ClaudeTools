@@ -75,14 +75,14 @@ class WoodParams:
         # Select Rings
         self.scale = 1.0               # 0.0-5.0
         self.seed = 0                  # integer
-        self.ring_frequency = "Quarter"  # Quarter/Half/Normal/Double
-        self.ring_phase = 30.0         # 0-360
-        self.ring_slant = 10.0         # -90 to 90
-        self.ring_bias = -30.7         # -100 to 100
-        self.ring_definition = 50.0    # 0-100
-        self.fade_areas = 0.0          # 0-100
-        self.streak_away = 30.0        # 0-100
-        self.dissolve = 40.0           # 0-100
+        self.ring_frequency = "Normal"   # Quarter/Half/Normal/Double
+        self.ring_phase = 15.0         # 0-360
+        self.ring_slant = 5.0          # -90 to 90
+        self.ring_bias = -10.0         # -100 to 100
+        self.ring_definition = 55.0    # 0-100
+        self.fade_areas = 5.0          # 0-100
+        self.streak_away = 40.0        # 0-100
+        self.dissolve = 20.0           # 0-100
 
         # Effects
         self.shade_effect1 = False
@@ -127,46 +127,66 @@ class WoodParams:
 # ──────────────────────────────────────────────────────────
 
 def generate_base_wood(params: WoodParams, size: int = 256) -> np.ndarray:
-    """Generate the base wood grain pattern (returns float array 0-1, shape HxW)."""
+    """Generate a plank-style wood grain pattern (returns float array 0-1, shape HxW).
+
+    The grain runs vertically (along Y axis) like sawn lumber, using
+    Y-stretched elliptical coordinates so that the ring arcs curve gently
+    across the board rather than forming concentric circles.
+    """
     w = h = size
     scale = max(params.scale, 0.01)
     freq_mult = RING_FREQ_MAP.get(params.ring_frequency, 1.0)
 
-    # Noise layers
+    # ── Noise layers ──
+    # noise1: large-scale grain distortion
     noise1 = _noise_grid(w, h, scale * 2.0, params.seed, octaves=4)
+    # noise2: fine detail / dissolve
     noise2 = _noise_grid(w, h, scale * 4.0, params.seed + 1, octaves=2)
+    # noise_streak: elongated noise for vertical streaks (sampled with
+    # compressed Y so features stretch along the grain direction)
+    noise_streak = _noise_grid(w, h, scale * 1.0, params.seed + 2, octaves=3,
+                               persistence=0.45)
 
-    # Coordinate grids
-    cx, cy = w / 2.0, h / 2.0
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    # ── Normalised coordinates (-1..1) ──
+    nx = np.linspace(-1.0, 1.0, w)[np.newaxis, :]  # 1×W
+    ny = np.linspace(-1.0, 1.0, h)[:, np.newaxis]  # H×1
+    # Broadcast to full grids
+    nx = np.broadcast_to(nx, (h, w)).copy()
+    ny = np.broadcast_to(ny, (h, w)).copy()
 
-    # Apply ring slant
+    # ── Ring slant – rotate the coordinate system ──
     slant_rad = np.radians(params.ring_slant)
-    dx = (xx - cx)
-    dy = (yy - cy)
-    # Rotate coordinates
-    rx = dx * np.cos(slant_rad) - dy * np.sin(slant_rad)
-    ry = dx * np.sin(slant_rad) + dy * np.cos(slant_rad)
+    cos_s, sin_s = np.cos(slant_rad), np.sin(slant_rad)
+    rx = nx * cos_s - ny * sin_s
+    ry = nx * sin_s + ny * cos_s
 
-    # Apply ring bias (shift the center of the rings)
+    # ── Ring bias – shift the ellipse centre horizontally ──
     bias = params.ring_bias / 100.0
-    rx += bias * w * 0.5
-    ry += bias * h * 0.3
+    rx += bias * 1.0  # shift left/right within -1..1 space
 
-    # Streak away – stretch noise contribution along x
+    # ── Y-stretch: the key to plank grain ──
+    # A large stretch value makes ring arcs nearly horizontal lines that
+    # curve gently, mimicking how a flat-sawn board looks.
+    y_stretch = 8.0 * scale
+    dist = np.sqrt(rx ** 2 + (ry / y_stretch) ** 2)
+
+    # ── Streak Away – add X-biased noise for vertical grain streaks ──
     streak = params.streak_away / 100.0
-    noise_contrib = noise1 * (1.0 + streak * 3.0)
+    # noise_streak naturally has some vertical coherence; we scale its
+    # contribution so the grain gets long wispy streaks along Y.
+    streak_contrib = noise_streak * streak * 0.8
+    # Also add large-scale distortion from noise1
+    grain_noise = noise1 * (0.5 + streak * 1.5) + streak_contrib
 
-    # Distance from center + noise = ring pattern
-    dist = np.sqrt(rx ** 2 + ry ** 2) / (w * 0.15 * scale)
+    # ── Ring pattern via sin() ──
     phase_offset = np.radians(params.ring_phase)
     ring_val = np.sin(
-        dist * freq_mult * np.pi * 2.0
-        + noise_contrib * 3.0
+        dist * freq_mult * np.pi * 6.0
+        + grain_noise * 3.0
         + phase_offset
     )
 
-    # Ring definition (sharpness)
+    # ── Ring definition (sharpness) ──
     definition = params.ring_definition / 100.0
     if definition > 0.5:
         power = 1.0 + (definition - 0.5) * 6.0
@@ -175,24 +195,24 @@ def generate_base_wood(params: WoodParams, size: int = 256) -> np.ndarray:
         power = 1.0 + (0.5 - definition) * 4.0
         ring_val = np.sign(ring_val) * np.abs(ring_val) ** power
 
-    # Fade areas
+    # ── Fade areas ──
     fade = params.fade_areas / 100.0
     if fade > 0:
-        fade_noise = _normalize(_noise_grid(w, h, scale * 8.0, params.seed + 3, octaves=2))
+        fade_noise = _normalize(_noise_grid(w, h, scale * 8.0, params.seed + 3,
+                                            octaves=2))
         ring_val *= (1.0 - fade * fade_noise)
 
-    # Dissolve (add noise)
+    # ── Dissolve (fine noise) ──
     dissolve = params.dissolve / 100.0
     if dissolve > 0:
         ring_val += noise2 * dissolve * 1.5
 
-    # Normalize to 0-1
+    # ── Normalize to 0-1 ──
     base = _normalize(ring_val)
 
-    # Apply groove depth
+    # ── Groove depth – darken the troughs ──
     groove = params.groove_depth / 50.0
     if groove > 0:
-        # Enhance contrast in dark areas to simulate grooves
         base = base ** (1.0 + groove * 0.5)
 
     return base
