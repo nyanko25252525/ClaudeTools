@@ -1,115 +1,34 @@
-"""Wood texture generation engine using Perlin noise and ring patterns."""
+"""Wood texture generation engine using OpenSimplex noise and ring patterns."""
 
 import numpy as np
 from PIL import Image, ImageFilter
-
-try:
-    from noise import pnoise2
-    HAS_NOISE_LIB = True
-except ImportError:
-    HAS_NOISE_LIB = False
+import opensimplex
 
 
-def _simplex_fallback(x, y, octaves=1, persistence=0.5, seed=0):
-    """Simple value noise fallback when the noise library is unavailable."""
-    rng = np.random.RandomState(seed)
-    val = 0.0
+def _noise_grid(width, height, scale, seed, octaves=4, persistence=0.5):
+    """Generate a 2D OpenSimplex noise grid with fractal octaves."""
+    result = np.zeros((height, width), dtype=np.float64)
+    if scale <= 0:
+        scale = 0.001
+
+    opensimplex.seed(seed)
+    base_offset = seed * 17.31
+
     amp = 1.0
     freq = 1.0
     max_amp = 0.0
     for _ in range(octaves):
-        ix = int(np.floor(x * freq)) & 255
-        iy = int(np.floor(y * freq)) & 255
-        fx = x * freq - np.floor(x * freq)
-        fy = y * freq - np.floor(y * freq)
-        perm = rng.permutation(256)
-        n00 = rng.RandomState(perm[ix] + perm[iy]).random()
-        n10 = rng.RandomState(perm[(ix + 1) & 255] + perm[iy]).random()
-        n01 = rng.RandomState(perm[ix] + perm[(iy + 1) & 255]).random()
-        n11 = rng.RandomState(perm[(ix + 1) & 255] + perm[(iy + 1) & 255]).random()
-        sx = fx * fx * (3 - 2 * fx)
-        sy = fy * fy * (3 - 2 * fy)
-        n0 = n00 * (1 - sx) + n10 * sx
-        n1 = n01 * (1 - sx) + n11 * sx
-        val += (n0 * (1 - sy) + n1 * sy) * amp
+        for y in range(height):
+            ny = (y / (height * scale) + base_offset) * freq
+            for x in range(width):
+                nx = (x / (width * scale) + base_offset) * freq
+                result[y, x] += opensimplex.noise2(nx, ny) * amp
         max_amp += amp
         amp *= persistence
         freq *= 2.0
-    return (val / max_amp) * 2.0 - 1.0
 
-
-def _perlin_grid(width, height, scale, seed, octaves=4, persistence=0.5):
-    """Generate a 2D Perlin noise grid."""
-    result = np.zeros((height, width), dtype=np.float64)
-    if scale <= 0:
-        scale = 0.001
-    base_seed = seed * 17.31
-    if HAS_NOISE_LIB:
-        for y in range(height):
-            for x in range(width):
-                result[y, x] = pnoise2(
-                    x / (width * scale) + base_seed,
-                    y / (height * scale) + base_seed,
-                    octaves=octaves,
-                    persistence=persistence,
-                    repeatx=1024,
-                    repeaty=1024,
-                )
-    else:
-        # Vectorized fallback using numpy
-        rng = np.random.RandomState(seed)
-        perm = np.arange(512, dtype=np.int32)
-        rng.shuffle(perm[:256])
-        perm[256:] = perm[:256]
-        grad_table = rng.uniform(-1, 1, (512, 2))
-
-        xs = np.arange(width, dtype=np.float64) / (width * scale) + base_seed
-        ys = np.arange(height, dtype=np.float64) / (height * scale) + base_seed
-
-        amp = 1.0
-        freq = 1.0
-        max_amp = 0.0
-        for _ in range(octaves):
-            fxs = xs * freq
-            fys = ys * freq
-
-            xi = np.floor(fxs).astype(np.int32) & 255
-            yi = np.floor(fys).astype(np.int32) & 255
-            xf = fxs - np.floor(fxs)
-            yf = fys - np.floor(fys)
-
-            u = xf * xf * xf * (xf * (xf * 6 - 15) + 10)
-            v = yf * yf * yf * (yf * (yf * 6 - 15) + 10)
-
-            for iy_idx in range(height):
-                yi_val = yi[iy_idx]
-                v_val = v[iy_idx]
-                yf_val = yf[iy_idx]
-                aa = perm[perm[xi] + yi_val]
-                ab = perm[perm[xi] + yi_val + 1]
-                ba = perm[perm[(xi + 1) & 255] + yi_val]
-                bb = perm[perm[(xi + 1) & 255] + yi_val + 1]
-
-                g_aa = grad_table[aa]
-                g_ba = grad_table[ba]
-                g_ab = grad_table[ab]
-                g_bb = grad_table[bb]
-
-                d_aa = g_aa[:, 0] * xf + g_aa[:, 1] * yf_val
-                d_ba = g_ba[:, 0] * (xf - 1) + g_ba[:, 1] * yf_val
-                d_ab = g_ab[:, 0] * xf + g_ab[:, 1] * (yf_val - 1)
-                d_bb = g_bb[:, 0] * (xf - 1) + g_bb[:, 1] * (yf_val - 1)
-
-                x1 = d_aa + u * (d_ba - d_aa)
-                x2 = d_ab + u * (d_bb - d_ab)
-                result[iy_idx, :] += (x1 + v_val * (x2 - x1)) * amp
-
-            max_amp += amp
-            amp *= persistence
-            freq *= 2.0
-
-        if max_amp > 0:
-            result /= max_amp
+    if max_amp > 0:
+        result /= max_amp
 
     return result
 
@@ -214,8 +133,8 @@ def generate_base_wood(params: WoodParams, size: int = 256) -> np.ndarray:
     freq_mult = RING_FREQ_MAP.get(params.ring_frequency, 1.0)
 
     # Noise layers
-    noise1 = _perlin_grid(w, h, scale * 2.0, params.seed, octaves=4)
-    noise2 = _perlin_grid(w, h, scale * 4.0, params.seed + 1, octaves=2)
+    noise1 = _noise_grid(w, h, scale * 2.0, params.seed, octaves=4)
+    noise2 = _noise_grid(w, h, scale * 4.0, params.seed + 1, octaves=2)
 
     # Coordinate grids
     cx, cy = w / 2.0, h / 2.0
@@ -259,7 +178,7 @@ def generate_base_wood(params: WoodParams, size: int = 256) -> np.ndarray:
     # Fade areas
     fade = params.fade_areas / 100.0
     if fade > 0:
-        fade_noise = _normalize(_perlin_grid(w, h, scale * 8.0, params.seed + 3, octaves=2))
+        fade_noise = _normalize(_noise_grid(w, h, scale * 8.0, params.seed + 3, octaves=2))
         ring_val *= (1.0 - fade * fade_noise)
 
     # Dissolve (add noise)
